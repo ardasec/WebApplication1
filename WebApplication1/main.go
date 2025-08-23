@@ -1,7 +1,7 @@
 package main
 
 import (
-	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -20,20 +20,13 @@ import (
 
 // Global state
 var (
-	db          *sql.DB
-	startTime   = time.Now()
-	ttlDuration time.Duration
-	recentCache = make(map[string]cached, 1000)
+	db        *sql.DB
+	startTime = time.Now()
+	
+	// Simple in-memory cache for the most recent URLs (optional)
+	recentCache = make(map[string]string, 1000)
 	cacheMutex  sync.RWMutex
-	clickCh     chan string
 )
-
-// Cache entry with TTL and optional expiry
-type cached struct {
-	URL       string
-	AddedAt   time.Time
-	ExpiresAt *time.Time
-}
 
 // Models
 type CreateURLRequest struct {
@@ -57,111 +50,127 @@ type StatsResponse struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// Database initialization with safer, separate statements and schema-qualified objects
+// Simple base62 encoding for fallback (if needed)
+const base62Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+func generateShortCode() string {
+	bytes := make([]byte, 6)
+	rand.Read(bytes)
+	
+	result := make([]byte, 6)
+	for i := 0; i < 6; i++ {
+		result[i] = base62Chars[bytes[i]%62]
+	}
+	
+	return string(result)
+}
+
+// Get next sequential number for short code
+func getNextSequentialCode() (string, error) {
+	var nextId int64
+	
+	// Get the next available ID from the sequence
+	query := `SELECT nextval('urls_id_seq')`
+	err := db.QueryRow(query).Scan(&nextId)
+	if err != nil {
+		return "", err
+	}
+	
+	return strconv.FormatInt(nextId, 10), nil
+}
+
+// Database initialization - simpler config
 func initDB() {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://ihdas:your-password@127.0.0.1:5432/ihdas?sslmode=disable"
+		dbURL = "postgres://ihdas:your-password@localhost/ihdas?sslmode=disable"
 	}
-
+	
 	var err error
 	db, err = sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal("Database connection failed:", err)
 	}
-
-	// Pool
+	
+	// Reasonable connection pool for portfolio project
 	db.SetMaxOpenConns(20)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Run each step separately to avoid multi-statement issues
-	steps := []string{
-		`CREATE TABLE IF NOT EXISTS public.urls (
-			id BIGSERIAL PRIMARY KEY,
-			short_code VARCHAR(10) UNIQUE NOT NULL,
-			original_url TEXT NOT NULL,
-			created_at TIMESTAMP DEFAULT NOW(),
-			expires_at TIMESTAMP,
-			click_count BIGINT DEFAULT 0
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_short_code ON public.urls(short_code)`,
-		`CREATE INDEX IF NOT EXISTS idx_expires_at ON public.urls(expires_at) WHERE expires_at IS NOT NULL`,
+	
+	// Create table with good indexing
+	createTable := `
+	CREATE TABLE IF NOT EXISTS urls (
+		id BIGSERIAL PRIMARY KEY,
+		short_code VARCHAR(10) UNIQUE NOT NULL,
+		original_url TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT NOW(),
+		expires_at TIMESTAMP,
+		click_count BIGINT DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_short_code ON urls(short_code);
+	CREATE INDEX IF NOT EXISTS idx_expires_at ON urls(expires_at) WHERE expires_at IS NOT NULL;
+	
+	-- Optimize sequence for better performance (cache 50 at a time)
+	ALTER SEQUENCE urls_id_seq CACHE 50;
+	`
+	
+	if _, err := db.Exec(createTable); err != nil {
+		log.Fatal("Table creation failed:", err)
 	}
-	for _, s := range steps {
-		if _, err := db.ExecContext(ctx, s); err != nil {
-			log.Fatalf("migration step failed: %v", err)
-		}
-	}
-
-	// If a serial sequence backs urls.id, optionally tune its cache size.
-	var seq sql.NullString
-	if err := db.QueryRowContext(ctx, `SELECT pg_get_serial_sequence('public.urls','id')`).Scan(&seq); err == nil && seq.Valid {
-		if _, err := db.ExecContext(ctx, fmt.Sprintf(`ALTER SEQUENCE %s CACHE 50`, seq.String)); err != nil {
-			log.Printf("note: skipping sequence cache tweak: %v", err)
-		}
-	}
-
-	log.Println("✅ PostgreSQL connected & migrations applied")
-	applyDBPoolSettings()
+	
+	log.Println("✅ PostgreSQL connected")
 }
 
 // Optional simple cache (just for demo purposes)
 func getCachedURL(shortCode string) (string, bool) {
 	cacheMutex.RLock()
-	c, exists := recentCache[shortCode]
+	url, exists := recentCache[shortCode]
 	cacheMutex.RUnlock()
-	if !exists {
-		return "", false
-	}
-	// TTL check
-	if ttlDuration > 0 && time.Since(c.AddedAt) > ttlDuration {
-		cacheMutex.Lock()
-		delete(recentCache, shortCode)
-		cacheMutex.Unlock()
-		return "", false
-	}
-	// Respect ExpiresAt if present
-	if c.ExpiresAt != nil && time.Now().After(*c.ExpiresAt) {
-		cacheMutex.Lock()
-		delete(recentCache, shortCode)
-		cacheMutex.Unlock()
-		return "", false
-	}
-	return c.URL, true
+	return url, exists
 }
 
-func setCachedURL(shortCode, originalURL string, expiresAt *time.Time) {
+func setCachedURL(shortCode, originalURL string) {
 	cacheMutex.Lock()
-	// Keep only last ~1000 URLs to prevent memory issues
+	// Keep only last 1000 URLs to prevent memory issues
 	if len(recentCache) >= 1000 {
-		for k := range recentCache { // drop one arbitrary entry
+		// Remove a random entry
+		for k := range recentCache {
 			delete(recentCache, k)
 			break
 		}
 	}
-	recentCache[shortCode] = cached{URL: originalURL, AddedAt: time.Now(), ExpiresAt: expiresAt}
+	recentCache[shortCode] = originalURL
 	cacheMutex.Unlock()
 }
 
-// Simple click counting (synchronous for simplicity with batched background flusher)
+// Simple click counting (synchronous for simplicity)
 func incrementClickCount(shortCode string) {
-	select {
-	case clickCh <- shortCode:
-	default:
-		// channel full; fallback to direct update to avoid losing count
-		_, _ = db.Exec("UPDATE public.urls SET click_count = click_count + 1 WHERE short_code = $1", shortCode)
-	}
+	db.Exec("UPDATE urls SET click_count = click_count + 1 WHERE short_code = $1", shortCode)
 }
 
-// Utilities
+// Utility functions
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if ips := strings.Split(xff, ","); len(ips) > 0 {
+			return strings.TrimSpace(ips[0])
+		}
+	}
+	
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+	
+	if ip := strings.Split(r.RemoteAddr, ":"); len(ip) > 0 {
+		return ip[0]
+	}
+	
+	return r.RemoteAddr
+}
+
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+	json.NewEncoder(w).Encode(data)
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
@@ -177,26 +186,25 @@ func createURLHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	defer r.Body.Close()
-
+	
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
-
+	
 	// Validate URL
 	if _, err := url.ParseRequestURI(req.OriginalURL); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid URL")
 		return
 	}
-
+	
 	// Generate or validate custom code
 	var shortCode string
 	if req.CustomCode != "" {
 		shortCode = req.CustomCode
 	} else {
-		// Generate sequential number from the sequence backing public.urls(id)
-		sequentialCode, err := getNextSequentialCode(r.Context())
+		// Generate sequential number
+		sequentialCode, err := getNextSequentialCode()
 		if err != nil {
 			log.Printf("Sequential code generation error: %v", err)
 			writeError(w, http.StatusInternalServerError, "Code generation error")
@@ -204,7 +212,7 @@ func createURLHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		shortCode = sequentialCode
 	}
-
+	
 	// Parse expiration if provided
 	var expiresAt *time.Time
 	if req.ExpiresAt != "" {
@@ -215,20 +223,18 @@ func createURLHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		expiresAt = &parsed
 	}
-
+	
 	// Insert into database
 	var id int64
 	var createdAt time.Time
-
-	query := `INSERT INTO public.urls (short_code, original_url, expires_at) 
+	
+	query := `INSERT INTO urls (short_code, original_url, expires_at) 
 			  VALUES ($1, $2, $3) 
 			  RETURNING id, created_at`
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	err = db.QueryRowContext(ctx, query, shortCode, req.OriginalURL, expiresAt).Scan(&id, &createdAt)
+	
+	err = db.QueryRow(query, shortCode, req.OriginalURL, expiresAt).Scan(&id, &createdAt)
 	if err != nil {
-		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(strings.ToLower(err.Error()), "unique") {
+		if strings.Contains(err.Error(), "duplicate key") {
 			writeError(w, http.StatusConflict, "Short code already exists")
 			return
 		}
@@ -236,10 +242,10 @@ func createURLHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
-
+	
 	// Cache the new URL
-	setCachedURL(shortCode, req.OriginalURL, expiresAt)
-
+	setCachedURL(shortCode, req.OriginalURL)
+	
 	// Build response
 	baseURL := fmt.Sprintf("https://%s", r.Host)
 	response := CreateURLResponse{
@@ -249,7 +255,7 @@ func createURLHandler(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   createdAt,
 		ExpiresAt:   expiresAt,
 	}
-
+	
 	writeJSON(w, http.StatusCreated, response)
 }
 
@@ -260,21 +266,20 @@ func redirectHandler(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "static/index.html")
 		return
 	}
-
+	
 	// Try cache first (optional optimization)
 	if originalURL, exists := getCachedURL(shortCode); exists {
 		incrementClickCount(shortCode)
-		http.Redirect(w, r, originalURL, http.StatusFound)
+		http.Redirect(w, r, originalURL, http.StatusMovedPermanently)
 		return
 	}
-
+	
 	// Query database
 	var originalURL string
 	var expiresAt *time.Time
-	query := `SELECT original_url, expires_at FROM public.urls WHERE short_code = $1`
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	err := db.QueryRowContext(ctx, query, shortCode).Scan(&originalURL, &expiresAt)
+	query := `SELECT original_url, expires_at FROM urls WHERE short_code = $1`
+	err := db.QueryRow(query, shortCode).Scan(&originalURL, &expiresAt)
+	
 	if err == sql.ErrNoRows {
 		http.NotFound(w, r)
 		return
@@ -283,17 +288,17 @@ func redirectHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-
+	
 	// Check expiration
 	if expiresAt != nil && time.Now().After(*expiresAt) {
 		http.Error(w, "Link expired", http.StatusGone)
 		return
 	}
-
+	
 	// Cache for next time and redirect
-	setCachedURL(shortCode, originalURL, expiresAt)
+	setCachedURL(shortCode, originalURL)
 	incrementClickCount(shortCode)
-	http.Redirect(w, r, originalURL, http.StatusFound)
+	http.Redirect(w, r, originalURL, http.StatusMovedPermanently)
 }
 
 func statsHandler(w http.ResponseWriter, r *http.Request) {
@@ -303,19 +308,16 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Invalid path")
 		return
 	}
-
+	
 	shortCode := parts[len(parts)-1]
-
+	
 	var stats StatsResponse
 	query := `SELECT short_code, original_url, click_count, created_at 
-			  FROM public.urls WHERE short_code = $1`
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	err := db.QueryRowContext(ctx, query, shortCode).Scan(
-		&stats.ShortCode, &stats.OriginalURL, &stats.ClickCount, &stats.CreatedAt,
-	)
-
+			  FROM urls WHERE short_code = $1`
+	
+	err := db.QueryRow(query, shortCode).Scan(
+		&stats.ShortCode, &stats.OriginalURL, &stats.ClickCount, &stats.CreatedAt)
+	
 	if err == sql.ErrNoRows {
 		writeError(w, http.StatusNotFound, "Short URL not found")
 		return
@@ -324,78 +326,42 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Database error")
 		return
 	}
-
+	
 	writeJSON(w, http.StatusOK, stats)
-}
-
-func applyDBPoolSettings() {
-	// Defaults
-	maxOpen := 30
-	maxIdle := 15
-	idleTime := time.Minute * 10
-
-	if v := os.Getenv("DB_MAX_OPEN_CONNS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			maxOpen = n
-		}
-	}
-	if v := os.Getenv("DB_MAX_IDLE_CONNS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			maxIdle = n
-		}
-	}
-	if v := os.Getenv("DB_CONN_MAX_IDLE_TIME"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
-			idleTime = d
-		}
-	}
-
-	db.SetMaxOpenConns(maxOpen)
-	db.SetMaxIdleConns(maxIdle)
-	db.SetConnMaxIdleTime(idleTime)
-
-	log.Printf("DB pool => maxOpen=%d maxIdle=%d idleTime=%s", maxOpen, maxIdle, idleTime)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	// Check database
 	dbStatus := "up"
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
+	if err := db.Ping(); err != nil {
 		dbStatus = "down"
 	}
-
+	
+	cacheSize := 0
 	cacheMutex.RLock()
-	cacheSize := len(recentCache)
+	cacheSize = len(recentCache)
 	cacheMutex.RUnlock()
-
+	
 	// Get total URL count
-	var totalURLs int64
-	if dbStatus == "up" {
-		ctx2, cancel2 := context.WithTimeout(r.Context(), 3*time.Second)
-		defer cancel2()
-		_ = db.QueryRowContext(ctx2, "SELECT COUNT(*) FROM public.urls").Scan(&totalURLs)
-	}
-
+	var totalUrls int64
+	db.QueryRow("SELECT COUNT(*) FROM urls").Scan(&totalUrls)
+	
 	status := map[string]interface{}{
-		"status":         "healthy",
-		"database":       dbStatus,
-		"cache_size":     cacheSize,
-		"uptime":         time.Since(startTime).String(),
-		"version":        "simple-go-postgresql-sequential",
-		"total_urls":     totalURLs,
-		"timestamp":      time.Now().Unix(),
-		"cache_ttl":      ttlDuration.String(),
-		"uptime_seconds": int(time.Since(startTime).Seconds()),
+		"status":      "healthy",
+		"database":    dbStatus,
+		"cache_size":  cacheSize,
+		"uptime":      time.Since(startTime).String(),
+		"version":     "simple-go-postgresql-sequential",
+		"total_urls":  totalUrls,
+		"timestamp":   time.Now().Unix(),
 	}
-
+	
 	if dbStatus == "down" {
 		status["status"] = "unhealthy"
 		writeJSON(w, http.StatusServiceUnavailable, status)
 		return
 	}
-
+	
 	writeJSON(w, http.StatusOK, status)
 }
 
@@ -408,22 +374,22 @@ func healthDashboardHandler(w http.ResponseWriter, r *http.Request) {
 func router(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	method := r.Method
-
+	
 	// Security headers
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-XSS-Protection", "1; mode=block")
-
+	
 	// CORS headers
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
+	
 	if method == "OPTIONS" {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-
+	
 	switch {
 	case path == "/health":
 		healthHandler(w, r)
@@ -443,68 +409,14 @@ func router(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// getNextSequentialCode returns the next value from the sequence backing public.urls(id)
-func getNextSequentialCode(parent context.Context) (string, error) {
-	var nextID int64
-	query := `SELECT nextval(pg_get_serial_sequence('public.urls','id'))`
-	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
-	defer cancel()
-	if err := db.QueryRowContext(ctx, query).Scan(&nextID); err != nil {
-		return "", err
-	}
-	return strconv.FormatInt(nextID, 10), nil
-}
-
 func main() {
 	// Initialize
 	initDB()
-
+	
 	// Create static directory but don't auto-generate index.html
-	_ = os.MkdirAll("static", 0755)
-
-	// read cache TTL from env (e.g., "15m", "1h"); default 30m
-	ttlDuration = 30 * time.Minute
-	if v := os.Getenv("CACHE_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			ttlDuration = d
-		} else {
-			log.Printf("invalid CACHE_TTL=%q, using default 30m", v)
-		}
-	}
-
-	clickCh = make(chan string, 10000)
-
-	// batch updater: aggregates counts and flushes every 1s or when many keys accumulate
-	go func() {
-		counts := make(map[string]int64, 1024)
-		ticker := time.NewTicker(time.Second)
-		flush := func() {
-			if len(counts) == 0 {
-				return
-			}
-			for sc, n := range counts {
-				if n <= 0 {
-					continue
-				}
-				if _, err := db.Exec("UPDATE public.urls SET click_count = click_count + $1 WHERE short_code = $2", n, sc); err != nil {
-					log.Printf("click batch update error for %s: %v", sc, err)
-				}
-			}
-			counts = make(map[string]int64, 1024)
-		}
-		for {
-			select {
-			case sc := <-clickCh:
-				counts[sc]++
-				if len(counts) > 2000 { // threshold safeguard
-					flush()
-				}
-			case <-ticker.C:
-				flush()
-			}
-		}
-	}()
-
+	os.MkdirAll("static", 0755)
+	
+	// Simple server configuration
 	server := &http.Server{
 		Addr:         ":" + getPort(),
 		Handler:      http.HandlerFunc(router),
@@ -512,13 +424,13 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-
+	
 	log.Printf("🚀 ihdas server starting on port %s", getPort())
 	log.Printf("📊 Simple architecture: Go + PostgreSQL")
 	log.Printf("📊 Health check: http://localhost:%s/health", getPort())
 	log.Printf("🔍 Health dashboard: http://localhost:%s/dashboard", getPort())
 	log.Printf("🎯 Sequential numbering enabled!")
-
+	
 	log.Fatal(server.ListenAndServe())
 }
 
