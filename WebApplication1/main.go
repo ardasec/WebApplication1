@@ -57,11 +57,11 @@ type StatsResponse struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// Database initialization - simpler config
+// Database initialization with safer, separate statements and schema-qualified objects
 func initDB() {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://ihdas:your-password@localhost/ihdas?sslmode=disable"
+		dbURL = "postgres://ihdas:your-password@127.0.0.1:5432/ihdas?sslmode=disable"
 	}
 
 	var err error
@@ -70,33 +70,42 @@ func initDB() {
 		log.Fatal("Database connection failed:", err)
 	}
 
-	// Reasonable connection pool for portfolio project
+	// Pool
 	db.SetMaxOpenConns(20)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	// Create table with good indexing
-	createTable := `
-CREATE TABLE IF NOT EXISTS urls (
-	id BIGSERIAL PRIMARY KEY,
-	short_code VARCHAR(10) UNIQUE NOT NULL,
-	original_url TEXT NOT NULL,
-	created_at TIMESTAMP DEFAULT NOW(),
-	expires_at TIMESTAMP,
-	click_count BIGINT DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_short_code ON urls(short_code);
-CREATE INDEX IF NOT EXISTS idx_expires_at ON urls(expires_at) WHERE expires_at IS NOT NULL;
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
--- Optimize sequence for better performance (cache 50 at a time)
-ALTER SEQUENCE urls_id_seq CACHE 50;
-`
-
-	if _, err := db.Exec(createTable); err != nil {
-		log.Fatal("Table creation failed:", err)
+	// Run each step separately to avoid multi-statement issues
+	steps := []string{
+		`CREATE TABLE IF NOT EXISTS public.urls (
+			id BIGSERIAL PRIMARY KEY,
+			short_code VARCHAR(10) UNIQUE NOT NULL,
+			original_url TEXT NOT NULL,
+			created_at TIMESTAMP DEFAULT NOW(),
+			expires_at TIMESTAMP,
+			click_count BIGINT DEFAULT 0
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_short_code ON public.urls(short_code)`,
+		`CREATE INDEX IF NOT EXISTS idx_expires_at ON public.urls(expires_at) WHERE expires_at IS NOT NULL`,
+	}
+	for _, s := range steps {
+		if _, err := db.ExecContext(ctx, s); err != nil {
+			log.Fatalf("migration step failed: %v", err)
+		}
 	}
 
-	log.Println("✅ PostgreSQL connected")
+	// If a serial sequence backs urls.id, optionally tune its cache size.
+	var seq sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT pg_get_serial_sequence('public.urls','id')`).Scan(&seq); err == nil && seq.Valid {
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`ALTER SEQUENCE %s CACHE 50`, seq.String)); err != nil {
+			log.Printf("note: skipping sequence cache tweak: %v", err)
+		}
+	}
+
+	log.Println("✅ PostgreSQL connected & migrations applied")
 	applyDBPoolSettings()
 }
 
@@ -144,7 +153,7 @@ func incrementClickCount(shortCode string) {
 	case clickCh <- shortCode:
 	default:
 		// channel full; fallback to direct update to avoid losing count
-		_, _ = db.Exec("UPDATE urls SET click_count = click_count + 1 WHERE short_code = $1", shortCode)
+		_, _ = db.Exec("UPDATE public.urls SET click_count = click_count + 1 WHERE short_code = $1", shortCode)
 	}
 }
 
@@ -186,7 +195,7 @@ func createURLHandler(w http.ResponseWriter, r *http.Request) {
 	if req.CustomCode != "" {
 		shortCode = req.CustomCode
 	} else {
-		// Generate sequential number
+		// Generate sequential number from the sequence backing public.urls(id)
 		sequentialCode, err := getNextSequentialCode(r.Context())
 		if err != nil {
 			log.Printf("Sequential code generation error: %v", err)
@@ -211,15 +220,15 @@ func createURLHandler(w http.ResponseWriter, r *http.Request) {
 	var id int64
 	var createdAt time.Time
 
-	query := `INSERT INTO urls (short_code, original_url, expires_at) 
+	query := `INSERT INTO public.urls (short_code, original_url, expires_at) 
 			  VALUES ($1, $2, $3) 
 			  RETURNING id, created_at`
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	err = db.QueryRowContext(ctx, query, shortCode, req.OriginalURL, expiresAt).Scan(&id, &createdAt)
 	if err != nil {
-		if strings.Contains(err.Error(), "duplicate key") {
+		if strings.Contains(err.Error(), "duplicate key") || strings.Contains(strings.ToLower(err.Error()), "unique") {
 			writeError(w, http.StatusConflict, "Short code already exists")
 			return
 		}
@@ -262,8 +271,8 @@ func redirectHandler(w http.ResponseWriter, r *http.Request) {
 	// Query database
 	var originalURL string
 	var expiresAt *time.Time
-	query := `SELECT original_url, expires_at FROM urls WHERE short_code = $1`
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	query := `SELECT original_url, expires_at FROM public.urls WHERE short_code = $1`
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	err := db.QueryRowContext(ctx, query, shortCode).Scan(&originalURL, &expiresAt)
 	if err == sql.ErrNoRows {
@@ -299,9 +308,9 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 
 	var stats StatsResponse
 	query := `SELECT short_code, original_url, click_count, created_at 
-			  FROM urls WHERE short_code = $1`
+			  FROM public.urls WHERE short_code = $1`
 
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	err := db.QueryRowContext(ctx, query, shortCode).Scan(
 		&stats.ShortCode, &stats.OriginalURL, &stats.ClickCount, &stats.CreatedAt,
@@ -366,7 +375,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	if dbStatus == "up" {
 		ctx2, cancel2 := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel2()
-		_ = db.QueryRowContext(ctx2, "SELECT COUNT(*) FROM urls").Scan(&totalURLs)
+		_ = db.QueryRowContext(ctx2, "SELECT COUNT(*) FROM public.urls").Scan(&totalURLs)
 	}
 
 	status := map[string]interface{}{
@@ -434,10 +443,10 @@ func router(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// getNextSequentialCode returns the next value from the sequence as a string
+// getNextSequentialCode returns the next value from the sequence backing public.urls(id)
 func getNextSequentialCode(parent context.Context) (string, error) {
 	var nextID int64
-	query := `SELECT nextval('urls_id_seq')`
+	query := `SELECT nextval(pg_get_serial_sequence('public.urls','id'))`
 	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
 	defer cancel()
 	if err := db.QueryRowContext(ctx, query).Scan(&nextID); err != nil {
@@ -477,7 +486,7 @@ func main() {
 				if n <= 0 {
 					continue
 				}
-				if _, err := db.Exec("UPDATE urls SET click_count = click_count + $1 WHERE short_code = $2", n, sc); err != nil {
+				if _, err := db.Exec("UPDATE public.urls SET click_count = click_count + $1 WHERE short_code = $2", n, sc); err != nil {
 					log.Printf("click batch update error for %s: %v", sc, err)
 				}
 			}
