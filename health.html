@@ -352,7 +352,7 @@
             const startTime = Date.now();
             
             try {
-                const response = await fetch('/health');
+                const response = await fetch('/api/health');
                 const data = await response.json();
                 const responseTime = Date.now() - startTime;
                 
@@ -390,10 +390,11 @@
 
             // Details
             document.getElementById('version').textContent = data.version || '--';
-            document.getElementById('goVersion').textContent = 'Go 1.21+';
-            document.getElementById('dbQueries').textContent = '--';
-            document.getElementById('memoryUsage').textContent = '--';
-            document.getElementById('activeConnections').textContent = '--';
+            document.getElementById('goVersion').textContent = data.go_version || '--';
+            document.getElementById('dbQueries').textContent = data.db_queries?.toLocaleString() || '--';
+            document.getElementById('memoryUsage').textContent = formatMemory(data.memory_usage);
+            document.getElementById('activeConnections').textContent = 
+                `${data.active_connections || '--'}/${data.max_connections || '--'}`;
             document.getElementById('responseTime').textContent = `${responseTime}ms`;
 
             // Last updated
